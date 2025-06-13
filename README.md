@@ -1,5 +1,6 @@
 # Intakeform_Chatbot
 
+Have python and ollama installed in windows.
 ✅ Step-by-Step Setup (Windows)
 🧩 1. Make sure you’re in your project folder
 Open Command Prompt or PowerShell, and run:
