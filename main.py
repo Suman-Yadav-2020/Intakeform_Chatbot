@@ -175,17 +175,17 @@ async def upload_pdf(file: UploadFile = File(...)):
         questions = generate_questions_from_text(text)
 
         print("✅ Questions generated successfully111",questions.raw[0])
-        session_id = "user123"  # Generate a real session ID
-        questions_new = questions.raw  
+        session_id = "user12343343"  # Generate a real session ID
+        questions_new = json.loads(questions.raw)  
         session_store[session_id] = {
-        "questions": questions.raw,
+        "questions": questions_new,
         "answers": [],
         "current_index": 0
         }
-        first_q = questions.raw[0]
-        # return {"question": first_q, "session_id": session_id}
+        first_q = questions_new[0]
+        return {"question": first_q, "session_id": session_id}
         # generate_questions_array(questions.raw)
-        return {"questions1": questions.raw}
+        # return {"questions1": json.loads(questions.raw)}
 
     except Exception as e:
         logging.error("❌ Exception occurred:", exc_info=True)
