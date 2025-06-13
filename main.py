@@ -1,5 +1,9 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile,Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from crewai import Agent, Task, Crew, LLM
+from textwrap import dedent
+import logging
 import pdfplumber
 import os
 import uvicorn
@@ -17,23 +21,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-
-# Example usage
-
-
-
-
 UPLOAD_DIR = "./uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Dummy local LLM function to simulate CrewAI use
-from crewai import Agent, Task, Crew, LLM
-from textwrap import dedent
 
 
-import logging
 
 logging.basicConfig(
     level=logging.INFO,  # Set to DEBUG if needed
@@ -47,39 +39,49 @@ llm = LLM(
     api_key="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"
 )
 
-# def classify_question(question, model="phi3"):
-#     prompt = f"""
-# You are a helpful assistant that classifies a question into one of these types:
 
-# - text
-# - date
-# - number
-# - email
-# - phone
-# - yes/no
-# - multiple choice
-# - checkbox
-# - textarea
 
-# Respond with **only the type**, nothing else.
+# Mock in-memory store
+session_store = {}
 
-# Question: {question}
-# Answer:
-# """.strip()
+class AnswerInput(BaseModel):
+    session_id: str
+    answer: str
 
-#     try:
-#         result = subprocess.run(
-#             ["ollama", "run", model],
-#             input=prompt,
-#             text=True,
-#             capture_output=True,
-#             check=True
-#         )
-#         print("✅ Ollama result:", result.stdout.strip().lower())
-#         return result.stdout.strip().lower()
-#     except subprocess.CalledProcessError as e:
-#         print("❌ Ollama error:", e.stderr)
-#         return "unknown"
+@app.get("/start")
+def start_form():
+    session_id = "user123"  # Generate a real session ID
+    questions = extract_questions(read_pdf())  # Get all questions once
+    session_store[session_id] = {
+        "questions": questions,
+        "answers": [],
+        "current_index": 0
+    }
+    first_q = questions[0]
+    return {"question": first_q, "session_id": session_id}
+
+@app.post("/next")
+def next_question(data: AnswerInput):
+    session = session_store.get(data.session_id)
+    if not session:
+        return {"error": "Session not found."}
+
+    # Save current answer
+    session["answers"].append(data.answer)
+
+    # Move to next question
+    session["current_index"] += 1
+    idx = session["current_index"]
+
+    if idx >= len(session["questions"]):
+        return {"message": "Form complete", "answers": session["answers"]}
+
+    next_q = session["questions"][idx]
+    return {"question": next_q}
+
+
+
+
 def generate_questions_from_text(text: str) -> list:
   
     # Create the agent
@@ -101,10 +103,10 @@ def generate_questions_from_text(text: str) -> list:
             {text}
             ---
 
-            Your job is to extract a list of questions that should be asked to the patient.
-            Only return the questions in a bullet-point list format and question types(e.g., text, date).
+            Your job is to extract and return a list of questions that should be asked to the patient.
+            
         """),
-        expected_output="A JSON reposne with a list of questions and question types(e.g., text, date ).",
+        expected_output="A JSON object containing a list of questions at a time and question types(e.g., text, date ).",
         agent=question_extractor,
     )
 
@@ -172,7 +174,16 @@ async def upload_pdf(file: UploadFile = File(...)):
 
         questions = generate_questions_from_text(text)
 
-        print("✅ Questions generated successfully",questions.raw)
+        print("✅ Questions generated successfully111",questions.raw[0])
+        session_id = "user123"  # Generate a real session ID
+        questions_new = questions.raw  
+        session_store[session_id] = {
+        "questions": questions.raw,
+        "answers": [],
+        "current_index": 0
+        }
+        first_q = questions.raw[0]
+        # return {"question": first_q, "session_id": session_id}
         # generate_questions_array(questions.raw)
         return {"questions1": questions.raw}
 
