@@ -66,29 +66,39 @@ def generate_questions_from_text(text: str) -> list:
     question_agent = Agent(
         role="Medical Intake Question Extractor",
         goal="Extract questions from intake form",
-        backstory="Parses forms and creates structured questions",
+        backstory="Parses forms and creates structured questions, including signature and consent",
         verbose=True,
         allow_delegation=False,
         llm=llm
     )
+
     task = Task(
         description=dedent(f"""
 You are analyzing a medical intake form.
 
-Your task is to extract **clear, patient-facing questions**. Convert any short labels or fragments into full questions. For example:
-- "Full Name" → "What is your full name?"
-- "DOB" → "What is your date of birth?"
-- "City" → "What city do you live in?"
+Your task is to extract:
+1. **Patient-facing questions** from the form fields
+2. **Consent or declaration statements** (like "I agree", "I consent", "I declare", etc.) and turn them into checkbox-type confirmation questions
+3. **Signature and date fields**, especially near consent sections
 
-Return a list of questions with:
-- "question": Full, grammatically correct question
-- "type": one of "text", "date", "radio", "checkbox", "select"
-- "options": List of options, only if type is radio, checkbox, or select
+**Examples:**
+- "Full Name" → {{ "question": "What is your full name?", "type": "text" }}
+- "DOB" → {{ "question": "What is your date of birth?", "type": "date" }}
+- "I consent to treatment" → {{ "question": "Do you agree to the following: 'I consent to treatment'?", "type": "checkbox", "options": ["I agree"] }}
+- "Signature" → {{ "question": "Please provide your digital signature", "type": "text" }}
+- "Date" → {{ "question": "What is today's date?", "type": "date" }}
 
-Example format:
+**Return a JSON list of questions in the following format:**
 [
-  {{ "question": "What is your full name?", "type": "text" }},
-  {{ "question": "What is your gender?", "type": "radio", "options": ["Male", "Female", "Other"] }},
+  {{
+    "question": "What is your full name?",
+    "type": "text"
+  }},
+  {{
+    "question": "Do you agree to the following: 'I agree to the terms and conditions'?",
+    "type": "checkbox",
+    "options": ["I agree"]
+  }},
   ...
 ]
 
@@ -100,8 +110,10 @@ Use the following form content to generate questions:
         expected_output="JSON list of questions",
         agent=question_agent
     )
+
     crew = Crew(agents=[question_agent], tasks=[task], verbose=True)
     return crew.kickoff(inputs={"input": text})
+
 
 def prefill_answers_from_questions(user_input: str, questions: list) -> dict:
     prefill_agent = Agent(
