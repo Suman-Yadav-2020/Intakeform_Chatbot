@@ -8,15 +8,16 @@ import logging
 import pdfplumber
 import os
 import json
+import re
 from datetime import datetime
-
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+     allow_origins=["http://localhost:5173"],  # frontend origin
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -30,6 +31,8 @@ llm = LLM(
     temperature=0.7,
     api_key=os.getenv("GROQ_API_KEY", "your_fallback_key")
 )
+class DescriptionRequest(BaseModel):
+    description: str
 
 session_store = {}
 
@@ -85,7 +88,7 @@ Your task is to extract:
 - "Full Name" → {{ "question": "What is your full name?", "type": "text" }}
 - "DOB" → {{ "question": "What is your date of birth?", "type": "date" }}
 - "I consent to treatment" → {{ "question": "Do you agree to the following: 'I consent to treatment'?", "type": "checkbox", "options": ["I agree"] }}
-- "Signature" → {{ "question": "Please provide your digital signature", "type": "text" }}
+- "Signature" → {{ "question": "Please provide your digital signature", "type": "signature" }}
 - "Date" → {{ "question": "What is today's date?", "type": "date" }}
 
 **Return a JSON list of questions in the following format:**
@@ -97,7 +100,7 @@ Your task is to extract:
   {{
     "question": "Do you agree to the following: 'I agree to the terms and conditions'?",
     "type": "checkbox",
-    "options": ["I agree"]
+    "options": ["I agree" ,I don't agree"]
   }},
   ...
 ]
@@ -146,6 +149,7 @@ Only include questions you can confidently answer.
     )
     crew = Crew(agents=[prefill_agent], tasks=[task], verbose=True)
     result = crew.kickoff(inputs={"input": user_input})
+    
     prefilled = json.loads(result.raw)
 
     # Fill today’s date for relevant date fields if missing
@@ -189,10 +193,24 @@ Return a clear, concise paragraph summarizing the patient information.
     return result.raw
 
 # ----------------------- API Endpoints -----------------------
+def clean_llm_json(text):
+    # Remove control characters and fix common mistakes
+    cleaned = text.replace('\r', '').replace('\t', ' ')
+    cleaned = re.sub(r'[\x00-\x1F\x7F]', '', cleaned)  # Remove non-printable chars
+    return cleaned.strip()
 
-@app.get("/load-form")
-def load_form_from_description(description: str):
+
+# Define your request body model
+
+
+# Dummy session_store (use a database or Redis in production)
+session_store = {}
+
+@app.post("/load-form")
+def load_form_from_description(request: DescriptionRequest):
     try:
+        description = request.description
+
         condition = classify_symptom_with_llm(description)
         logging.info(f"Condition: {condition}")
 
@@ -209,7 +227,8 @@ def load_form_from_description(description: str):
             raise ValueError("No extractable text in PDF")
 
         questions = generate_questions_from_text(text)
-        questions_list = json.loads(questions.raw)
+        raw_output = clean_llm_json(questions.raw)
+        questions_list = json.loads(raw_output)
 
         prefilled = prefill_answers_from_questions(description, questions_list)
 
@@ -246,6 +265,7 @@ def load_form_from_description(description: str):
         logging.error("Error in load-form", exc_info=True)
         return {"error": str(e)}
 
+
 @app.post("/next")
 def next_question(data: AnswerInput):
     session = session_store.get(data.session_id)
@@ -263,7 +283,8 @@ def next_question(data: AnswerInput):
             "message": "Form complete",
             "answers": session["answers"],
             "summary": summary,
-            "next_question": None
+           
+            
         }
 
     session["current_index"] = next_idx
