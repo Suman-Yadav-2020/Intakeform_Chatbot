@@ -10,12 +10,26 @@ import os
 import json
 import re
 from datetime import datetime
-app = FastAPI()
+from typing import Optional, Union
+import base64
+import tempfile
+import whisper  # Use OpenAI Whisper or faster-whisper
 
+whisper_model = whisper.load_model("base")  # Or "small", "medium", etc.
+
+def transcribe_base64_audio(base64_audio_str: str) -> str:
+    audio_bytes = base64.b64decode(base64_audio_str)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+        tmpfile.write(audio_bytes)
+        tmpfile.flush()
+        result = whisper_model.transcribe(tmpfile.name)
+    return result["text"].strip()
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-     allow_origins=["http://localhost:5173"],  # frontend origin
+    allow_origins=["http://localhost:5173"],  # frontend origin
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -29,41 +43,31 @@ logging.basicConfig(level=logging.INFO)
 llm = LLM(
     model="groq/gemma2-9b-it",
     temperature=0.7,
-    api_key=os.getenv("GROQ_API_KEY", "your_fallback_key")
+    api_key="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"
 )
-class DescriptionRequest(BaseModel):
-    description: str
 
 session_store = {}
 
+
+class DescriptionRequest(BaseModel):
+    description: Optional[str] = None
+    voice_description: Optional[str] = None
+
+
+
+class FollowupStepInput(BaseModel):
+    session_id: str
+    question: Optional[str] = None
+    answer: Optional[str] = None
+
+
 class AnswerInput(BaseModel):
     session_id: str
-    answer: str | list[str]
+    answer: Union[str, list[str]]
+
 
 # ----------------------- LLM Agents -----------------------
 
-def classify_symptom_with_llm(user_input: str) -> str:
-    classifier_agent = Agent(
-        role="Medical Condition Classifier",
-        goal="Classify symptoms into a medical condition",
-        backstory="Classifies patient issues into intake categories",
-        verbose=True,
-        allow_delegation=False,
-        llm=llm
-    )
-    task = Task(
-        description=dedent(f"""
-        Classify the following into a simple condition like:
-        fever, orthopedic, dental, diabetes, eye, etc.
-
-        Input:
-        "{user_input}"
-        """),
-        expected_output="One-word label",
-        agent=classifier_agent,
-    )
-    crew = Crew(agents=[classifier_agent], tasks=[task], verbose=True)
-    return crew.kickoff(inputs={"input": user_input}).raw.strip().lower()
 
 def generate_questions_from_text(text: str) -> list:
     question_agent = Agent(
@@ -149,7 +153,7 @@ Only include questions you can confidently answer.
     )
     crew = Crew(agents=[prefill_agent], tasks=[task], verbose=True)
     result = crew.kickoff(inputs={"input": user_input})
-    
+
     prefilled = json.loads(result.raw)
 
     # Fill today’s date for relevant date fields if missing
@@ -162,107 +166,348 @@ Only include questions you can confidently answer.
 
     return prefilled
 
+
 def get_next_unanswered_index(answers: list):
     for idx, ans in enumerate(answers):
         if ans is None:
             return idx
     return None
 
+
 def generate_summary_from_answers(answers: list, questions: list):
     combined = {q['question']: a for q, a in zip(questions, answers) if a is not None}
+
     summary_agent = Agent(
         role="Medical Summary Generator",
-        goal="Summarize completed intake answers",
-        backstory="Builds a readable summary from patient responses",
+        goal="Summarize completed intake answers into bullet points",
+        backstory=(
+            "Takes patient intake form responses and produces a clear, concise bullet-point summary "
+            "with a focus on key clinical fields like age, gender, symptoms, duration, and relevant history."
+        ),
         verbose=True,
         allow_delegation=False,
         llm=llm
     )
+
     task = Task(
         description=dedent(f"""
-Use the following completed answers to summarize the patient intake:
-{json.dumps(combined, indent=2)}
+        You are summarizing a completed medical intake form.
 
-Return a clear, concise paragraph summarizing the patient information.
-"""),
-        expected_output="Text summary",
+        Use the answers below to generate a professional medical summary in **bullet points**:
+        {json.dumps(combined, indent=2)}
+
+        🟢 **Guidelines:**
+        - Highlight key fields like: Name, Age, Gender, Primary Complaint or Symptoms, Duration, Past Medical History, Medications, Allergies
+        - Keep each bullet short, informative, and medically relevant
+        - Do not repeat the questions; synthesize them into structured points
+        - Omit any empty or irrelevant fields
+
+        ✅ Output format:
+        - Name: ...
+        - Age: ...
+        - Gender: ...
+        - Symptoms: ...
+        - Duration: ...
+        - History: ...
+        - Medications: ...
+        - Allergies: ...
+        - Signature Confirmed: Yes/No
+        - Date: ...
+
+        Only use bullet points. No intro or conclusion.
+        """),
+        expected_output="Bullet point list summary of intake answers",
         agent=summary_agent
     )
+
     crew = Crew(agents=[summary_agent], tasks=[task], verbose=True)
     result = crew.kickoff()
     return result.raw
 
+
+def validate_answer(answer, question):
+    qtype = question.get("type")
+    options = question.get("options")
+
+    # Skip validation for signature or text questions
+    if qtype in ["signature", "text"]:
+        return True
+
+    # Rule-based: date format check
+    if qtype == "date":
+        if isinstance(answer, str) and answer.strip() == "":
+            return True  # allow empty
+        try:
+            datetime.strptime(answer, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Answer must be a valid date in YYYY-MM-DD format")
+
+    # Rule-based: options check
+    if options:
+        if isinstance(answer, str) and answer not in options:
+            raise ValueError(f"Answer must be one of: {options}")
+        if isinstance(answer, list):
+            if not all(a in options for a in answer):
+                raise ValueError(f"All selected answers must be among: {options}")
+
+    # Skip LLM validation for checkbox or date fields (already rule-based)
+    if qtype in ["checkbox", "date"]:
+        return True
+
+    # Only run LLM validation for unknown or custom types
+    try:
+        validator_agent = Agent(
+            role="Form Answer Validator",
+            goal="Verify if the answer is logically valid for the question",
+            backstory="Helps validate answers in a form-filling context and explains why if not valid",
+            verbose=False,
+            allow_delegation=False,
+            llm=llm
+        )
+        task = Task(
+            description=dedent(f"""
+            You are validating a form answer. Given the question and answer, determine if the answer makes sense.
+
+            Question: "{question['question']}"
+            Answer: "{answer}"
+
+            If the answer is valid, reply exactly: VALID
+
+            If the answer is not valid, reply in the format:
+            INVALID: <Short explanation why it's invalid>
+            """),
+            expected_output="VALID or INVALID: <reason>",
+            agent=validator_agent
+        )
+        crew = Crew(agents=[validator_agent], tasks=[task], verbose=False)
+        result = crew.kickoff().raw.strip()
+
+        if result.upper().startswith("VALID"):
+            return True
+        elif result.upper().startswith("INVALID"):
+            reason = result.partition(":")[2].strip()
+            raise ValueError(f"LLM Validation failed: {reason}")
+        else:
+            raise ValueError(f"Unexpected validation output: {result}")
+    except Exception as e:
+        raise ValueError(f"Answer validation failed: {e}")
+
+
 # ----------------------- API Endpoints -----------------------
-def clean_llm_json(text):
-    # Remove control characters and fix common mistakes
-    cleaned = text.replace('\r', '').replace('\t', ' ')
-    cleaned = re.sub(r'[\x00-\x1F\x7F]', '', cleaned)  # Remove non-printable chars
-    return cleaned.strip()
-
-
-# Define your request body model
+def clean_llm_json(text: str) -> str:
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    text = re.sub(r'[\x00-\x1F\x7F]', '', text)  # Remove control characters
+    text = re.sub(r",(\s*[}\]])", r"\1", text)  # Trailing commas
+    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)  # Remove markdown blocks
+    return text.strip()
 
 
 # Dummy session_store (use a database or Redis in production)
 session_store = {}
+
+
+def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
+    followup_agent = Agent(
+        role="Telemedicine Diagnostic Assistant",
+        goal="Identify exact single-word disease name or ask follow-up",
+        backstory="Acts as a step-by-step medical assistant in a telemedicine chatbot, returning exact disease names for routing to appropriate forms.",
+        verbose=False,
+        allow_delegation=False,
+        llm=llm
+    )
+
+    qa_str = "\n".join(f"- {q}: {a}" for q, a in previous_answers.items())
+
+    task = Task(
+        description=dedent(f"""
+    You are assisting in a telemedicine triage session.
+
+    Symptom: "{original_input}"
+
+    Patient has already answered:
+    {qa_str if qa_str else "None"}
+
+    ⚠️ Do not repeat previous questions.
+
+    🤖 Use the **answers to guide your logic**:
+    - If they say “No” to exertion-based symptoms, consider **non-cardiac** causes.
+    - If they say “Yes” to heartburn or meals, consider **digestive**.
+
+    👉 If more clarification is needed, return:
+    {{
+    "next_question": {{
+        "question": "...",
+        "type": "checkbox",
+        "options": ["Yes", "No"]
+    }}
+    }}
+
+    👉 If confident, return:
+    {{
+    "disease": "gastritis"
+    }}
+
+    ⚠️ Disease must be one lowercase word. No commentary.
+    """),
+        expected_output="Strict JSON with either 'next_question' or 'disease'",
+        agent=followup_agent
+    )
+
+    crew = Crew(agents=[followup_agent], tasks=[task], verbose=False)
+    result = crew.kickoff()
+    raw_output = crew.kickoff().raw.strip()
+    logging.error(f"[LLM RAW OUTPUT] {raw_output}")  # 👈 critical
+
+    try:
+        cleaned = clean_llm_json(raw_output)
+        logging.error(f"[CLEANED OUTPUT] {cleaned}")  # 👈 see if it's valid JSON now
+        parsed = json.loads(cleaned)
+        return parsed
+    except Exception as e:
+        logging.exception("❌ JSON parsing failed in follow-up step")
+        raise ValueError("Failed to parse LLM output for follow-up step")
+
+
+def start_form_filling_flow(session_id, input_text, disease):
+    # Step 1: Classify detailed disease to category using LLM
+    category = classify_disease_to_category(disease)
+
+    # Step 2: Load the form PDF based on category
+    pdf_path = os.path.join("forms", f"{category}.pdf")
+    if not os.path.exists(pdf_path):
+        pdf_path = os.path.join("forms", "generic.pdf")
+
+    print(f"🎯 Disease: {disease}")
+    print(f"📂 Category: {category}")
+    print(f"📄 PDF picked: {pdf_path}")
+    # Step 3: Extract text from the PDF
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ''.join(page.extract_text() or '' for page in pdf.pages)
+
+    if not text.strip():
+        raise ValueError("No extractable text in PDF")
+
+    # Step 4: Generate questions from form content
+    questions = generate_questions_from_text(text)
+    raw_output = clean_llm_json(questions.raw)
+    questions_list = json.loads(raw_output)
+
+    # Step 5: Try to prefill answers from user input
+    prefilled = prefill_answers_from_questions(input_text, questions_list)
+    answers = [prefilled.get(q['question'], None) for q in questions_list]
+    unanswered_index = get_next_unanswered_index(answers)
+
+    # Step 6: Store session state
+    session_store[session_id] = {
+        "questions": questions_list,
+        "answers": answers,
+        "current_index": unanswered_index,
+        "current_phase": "form_filling",
+        "disease": disease,
+        "category": category
+    }
+
+    # Step 7: Return next step
+    if unanswered_index is None:
+        summary = generate_summary_from_answers(answers, questions_list)
+        return {
+            "message": "Form fully prefilled!",
+            "answers": answers,
+            "summary": summary,
+            "next_question": None,
+            "current_phase": "form_filling"
+        }
+
+    return {
+        "next_question": questions_list[unanswered_index],
+        "session_id": session_id,
+        "prefilled_answers": prefilled,
+        "current_phase": "form_filling"
+    }
+
+
+def classify_disease_to_category(disease_name: str) -> str:
+    classifier_agent = Agent(
+        role="Medical Disease Category Classifier",
+        goal="Map detailed diseases to general one-word categories",
+        backstory="Helps group specific diagnoses into simplified categories for form routing (e.g., cardiac, respiratory, digestive).",
+        verbose=False,
+        allow_delegation=False,
+        llm=llm
+    )
+
+    task = Task(
+        description=dedent(f"""
+You are classifying a medical disease into a general one-word category.
+
+Given the disease: "{disease_name}"
+
+Choose ONE of the following categories:
+cardiac
+respiratory
+neurology
+mental
+digestive
+endocrine
+fever
+dermatology
+pain
+urinary
+dental
+general
+
+Return ONLY the category name. No punctuation. No extra words. Lowercase only.
+
+Examples:
+"myocardial infarction" → "cardiac"
+"panic attack" → "mental"
+"gastritis" → "digestive"
+        """),
+        expected_output="One of the listed category names",
+        agent=classifier_agent
+    )
+
+    crew = Crew(agents=[classifier_agent], tasks=[task], verbose=False)
+    result = crew.kickoff()
+    return result.raw.strip().lower()
+
 
 @app.post("/load-form")
 def load_form_from_description(request: DescriptionRequest):
     try:
         description = request.description
 
-        condition = classify_symptom_with_llm(description)
-        logging.info(f"Condition: {condition}")
+        if not description and request.voice_description:
+            description = transcribe_base64_audio(request.voice_description)
 
-        pdf_path = os.path.join("forms", f"{condition}.pdf")
-        if not os.path.exists(pdf_path):
-            pdf_path = os.path.join("forms", "generic.pdf")
-        if not os.path.exists(pdf_path):
-            return {"error": "Form not found."}
+        if not description:
+            raise ValueError("No description or voice input provided")
 
-        with pdfplumber.open(pdf_path) as pdf:
-            text = ''.join(page.extract_text() or '' for page in pdf.pages)
-
-        if not text.strip():
-            raise ValueError("No extractable text in PDF")
-
-        questions = generate_questions_from_text(text)
-        raw_output = clean_llm_json(questions.raw)
-        questions_list = json.loads(raw_output)
-
-        prefilled = prefill_answers_from_questions(description, questions_list)
-
-        answers = []
-        for q in questions_list:
-            ans = prefilled.get(q['question'], None)
-            answers.append(ans)
-
-        unanswered_index = get_next_unanswered_index(answers)
-
-        session_id = f"user_{condition}"
+        session_id = f"clarify_{hash(description)}"
         session_store[session_id] = {
-            "questions": questions_list,
-            "answers": answers,
-            "current_index": unanswered_index
+            "original_input": description,
+            "clarification_state": {"previous_answers": {}},
+            "current_phase": "clarification"
         }
 
-        if unanswered_index is None:
-            summary = generate_summary_from_answers(answers, questions_list)
+        result = ask_next_followup_step(description, {})
+
+        if "next_question" in result:
+            session_store[session_id]["clarification_state"]["current_question"] = result["next_question"]["question"]
             return {
-                "message": "Form fully prefilled!",
-                "answers": answers,
-                "summary": summary,
-                "next_question": None
+                "next_question": result["next_question"],
+                "session_id": session_id,
+                "current_phase": "clarification"
             }
 
-        return {
-            "next_question": questions_list[unanswered_index],
-            "session_id": session_id,
-            "prefilled_answers": prefilled
-        }
+        elif "disease" in result:
+            disease = result["disease"]
+            return start_form_filling_flow(session_id, description, disease)
+
+        return {"error": "Unable to classify or continue"}
 
     except Exception as e:
-        logging.error("Error in load-form", exc_info=True)
+        logging.error("Error in /load-form", exc_info=True)
         return {"error": str(e)}
 
 
@@ -272,9 +517,18 @@ def next_question(data: AnswerInput):
     if not session:
         return {"error": "Session not found"}
 
-    idx = session["current_index"]
-    session["answers"][idx] = data.answer
+    if session.get("current_phase") != "form_filling":
+        return {"error": "Not in form filling phase"}
 
+    idx = session["current_index"]
+    question = session["questions"][idx]
+
+    try:
+        validate_answer(data.answer, question)
+    except ValueError as ve:
+        return {"error": str(ve)}
+
+    session["answers"][idx] = data.answer
     next_idx = get_next_unanswered_index(session["answers"])
 
     if next_idx is None:
@@ -282,15 +536,38 @@ def next_question(data: AnswerInput):
         return {
             "message": "Form complete",
             "answers": session["answers"],
-            "summary": summary,
-           
-            
+            "summary": summary
         }
 
     session["current_index"] = next_idx
-    return {
-        "next_question": session["questions"][next_idx]
-    }
+    return {"next_question": session["questions"][next_idx]}
+
+
+@app.post("/followup-step")
+def followup_step(data: FollowupStepInput):
+    session = session_store.get(data.session_id)
+    if not session or session.get("current_phase") != "clarification":
+        return {"error": "Invalid session or not in clarification phase"}
+
+    clarification = session.setdefault("clarification_state", {"previous_answers": {}})
+    if data.question and data.answer:
+        clarification["previous_answers"][data.question] = data.answer
+
+    result = ask_next_followup_step(
+        original_input=session["original_input"],
+        previous_answers=clarification["previous_answers"]
+    )
+
+    if "next_question" in result:
+        session["clarification_state"]["current_question"] = result["next_question"]["question"]
+        return {"next_question": result["next_question"]}
+
+    elif "disease" in result:
+        disease = result["disease"]
+        return start_form_filling_flow(data.session_id, session["original_input"], disease)
+
+    return {"error": "Unexpected result from follow-up logic"}
+
 
 @app.post("/upload-pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -321,8 +598,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         logging.error("Upload failed", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 # ----------------------- Start App -----------------------
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
