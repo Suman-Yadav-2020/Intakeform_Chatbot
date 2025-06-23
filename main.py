@@ -11,25 +11,13 @@ import json
 import re
 from datetime import datetime
 from typing import Optional, Union
-import base64
-import tempfile
-import whisper  # Use OpenAI Whisper or faster-whisper
-
-whisper_model = whisper.load_model("base")  # Or "small", "medium", etc.
-
-def transcribe_base64_audio(base64_audio_str: str) -> str:
-    audio_bytes = base64.b64decode(base64_audio_str)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
-        tmpfile.write(audio_bytes)
-        tmpfile.flush()
-        result = whisper_model.transcribe(tmpfile.name)
-    return result["text"].strip()
 
 app = FastAPI()
 
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # frontend origin
+     allow_origins=["http://localhost:5173"],  # frontend origin
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -48,24 +36,17 @@ llm = LLM(
 
 session_store = {}
 
-
 class DescriptionRequest(BaseModel):
-    description: Optional[str] = None
-    voice_description: Optional[str] = None
-
-
+    description: str
 
 class FollowupStepInput(BaseModel):
     session_id: str
     question: Optional[str] = None
     answer: Optional[str] = None
 
-
 class AnswerInput(BaseModel):
     session_id: str
     answer: Union[str, list[str]]
-
-
 # ----------------------- LLM Agents -----------------------
 
 
@@ -153,7 +134,7 @@ Only include questions you can confidently answer.
     )
     crew = Crew(agents=[prefill_agent], tasks=[task], verbose=True)
     result = crew.kickoff(inputs={"input": user_input})
-
+    
     prefilled = json.loads(result.raw)
 
     # Fill today’s date for relevant date fields if missing
@@ -166,64 +147,35 @@ Only include questions you can confidently answer.
 
     return prefilled
 
-
 def get_next_unanswered_index(answers: list):
     for idx, ans in enumerate(answers):
         if ans is None:
             return idx
     return None
 
-
 def generate_summary_from_answers(answers: list, questions: list):
     combined = {q['question']: a for q, a in zip(questions, answers) if a is not None}
-
     summary_agent = Agent(
         role="Medical Summary Generator",
-        goal="Summarize completed intake answers into bullet points",
-        backstory=(
-            "Takes patient intake form responses and produces a clear, concise bullet-point summary "
-            "with a focus on key clinical fields like age, gender, symptoms, duration, and relevant history."
-        ),
+        goal="Summarize completed intake answers",
+        backstory="Builds a readable summary from patient responses",
         verbose=True,
         allow_delegation=False,
         llm=llm
     )
-
     task = Task(
         description=dedent(f"""
-        You are summarizing a completed medical intake form.
+Use the following completed answers to summarize the patient intake:
+{json.dumps(combined, indent=2)}
 
-        Use the answers below to generate a professional medical summary in **bullet points**:
-        {json.dumps(combined, indent=2)}
-
-        🟢 **Guidelines:**
-        - Highlight key fields like: Name, Age, Gender, Primary Complaint or Symptoms, Duration, Past Medical History, Medications, Allergies
-        - Keep each bullet short, informative, and medically relevant
-        - Do not repeat the questions; synthesize them into structured points
-        - Omit any empty or irrelevant fields
-
-        ✅ Output format:
-        - Name: ...
-        - Age: ...
-        - Gender: ...
-        - Symptoms: ...
-        - Duration: ...
-        - History: ...
-        - Medications: ...
-        - Allergies: ...
-        - Signature Confirmed: Yes/No
-        - Date: ...
-
-        Only use bullet points. No intro or conclusion.
-        """),
-        expected_output="Bullet point list summary of intake answers",
+Return a clear, concise paragraph summarizing the patient information.
+"""),
+        expected_output="Text summary",
         agent=summary_agent
     )
-
     crew = Crew(agents=[summary_agent], tasks=[task], verbose=True)
     result = crew.kickoff()
     return result.raw
-
 
 def validate_answer(answer, question):
     qtype = question.get("type")
@@ -292,7 +244,6 @@ def validate_answer(answer, question):
     except Exception as e:
         raise ValueError(f"Answer validation failed: {e}")
 
-
 # ----------------------- API Endpoints -----------------------
 def clean_llm_json(text: str) -> str:
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
@@ -301,10 +252,8 @@ def clean_llm_json(text: str) -> str:
     text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)  # Remove markdown blocks
     return text.strip()
 
-
 # Dummy session_store (use a database or Redis in production)
 session_store = {}
-
 
 def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
     followup_agent = Agent(
@@ -319,7 +268,7 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
     qa_str = "\n".join(f"- {q}: {a}" for q, a in previous_answers.items())
 
     task = Task(
-        description=dedent(f"""
+    description=dedent(f"""
     You are assisting in a telemedicine triage session.
 
     Symptom: "{original_input}"
@@ -349,8 +298,8 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
 
     ⚠️ Disease must be one lowercase word. No commentary.
     """),
-        expected_output="Strict JSON with either 'next_question' or 'disease'",
-        agent=followup_agent
+    expected_output="Strict JSON with either 'next_question' or 'disease'",
+    agent=followup_agent
     )
 
     crew = Crew(agents=[followup_agent], tasks=[task], verbose=False)
@@ -366,7 +315,6 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
     except Exception as e:
         logging.exception("❌ JSON parsing failed in follow-up step")
         raise ValueError("Failed to parse LLM output for follow-up step")
-
 
 def start_form_filling_flow(session_id, input_text, disease):
     # Step 1: Classify detailed disease to category using LLM
@@ -425,7 +373,6 @@ def start_form_filling_flow(session_id, input_text, disease):
         "current_phase": "form_filling"
     }
 
-
 def classify_disease_to_category(disease_name: str) -> str:
     classifier_agent = Agent(
         role="Medical Disease Category Classifier",
@@ -453,7 +400,6 @@ fever
 dermatology
 pain
 urinary
-dental
 general
 
 Return ONLY the category name. No punctuation. No extra words. Lowercase only.
@@ -471,18 +417,10 @@ Examples:
     result = crew.kickoff()
     return result.raw.strip().lower()
 
-
 @app.post("/load-form")
 def load_form_from_description(request: DescriptionRequest):
     try:
         description = request.description
-
-        if not description and request.voice_description:
-            description = transcribe_base64_audio(request.voice_description)
-
-        if not description:
-            raise ValueError("No description or voice input provided")
-
         session_id = f"clarify_{hash(description)}"
         session_store[session_id] = {
             "original_input": description,
@@ -509,7 +447,6 @@ def load_form_from_description(request: DescriptionRequest):
     except Exception as e:
         logging.error("Error in /load-form", exc_info=True)
         return {"error": str(e)}
-
 
 @app.post("/next")
 def next_question(data: AnswerInput):
@@ -541,7 +478,6 @@ def next_question(data: AnswerInput):
 
     session["current_index"] = next_idx
     return {"next_question": session["questions"][next_idx]}
-
 
 @app.post("/followup-step")
 def followup_step(data: FollowupStepInput):
@@ -598,10 +534,8 @@ async def upload_pdf(file: UploadFile = File(...)):
         logging.error("Upload failed", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-
 # ----------------------- Start App -----------------------
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
