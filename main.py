@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 llm = LLM(
     model="groq/gemma2-9b-it",
     temperature=0.7,
-    api_key="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"
+    api_key="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"
 )
 
 session_store = {}
