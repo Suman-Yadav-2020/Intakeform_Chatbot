@@ -49,6 +49,7 @@ class FollowupStepInput(BaseModel):
     question: Optional[str] = None
     answer: Optional[str] = None
 
+
 class AnswerInput(BaseModel):
     session_id: str
     answer: Union[str, list[str], None] = None
