@@ -11,6 +11,9 @@ import json
 import re
 from datetime import datetime
 from typing import Optional, Union
+import whisper
+import base64
+
 
 app = FastAPI()
 
@@ -34,6 +37,8 @@ llm = LLM(
     api_key="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"
 )
 
+whisper_model = whisper.load_model("tiny")
+
 session_store = {}
 
 class DescriptionRequest(BaseModel):
@@ -46,8 +51,23 @@ class FollowupStepInput(BaseModel):
 
 class AnswerInput(BaseModel):
     session_id: str
-    answer: Union[str, list[str]]
+    answer: Union[str, list[str], None] = None
+    voice_answer: Optional[str] = None
+
 # ----------------------- LLM Agents -----------------------
+# ----------------------- Helper Functions -----------------------
+
+def transcribe_base64_audio(base64_audio_str: str) -> str:
+    try:
+        audio_bytes = base64.b64decode(base64_audio_str)
+        with open("temp.wav", "wb") as f:
+            f.write(audio_bytes)
+        result = whisper_model.transcribe("temp.wav")
+        return result["text"].strip()
+    except Exception as e:
+        logging.error("Transcription failed", exc_info=True)
+        raise RuntimeError("Voice transcription error: " + str(e))
+
 
 
 def generate_questions_from_text(text: str) -> list:
