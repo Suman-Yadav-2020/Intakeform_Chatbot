@@ -42,7 +42,10 @@ whisper_model = whisper.load_model("tiny")
 session_store = {}
 
 class DescriptionRequest(BaseModel):
-    description: str
+    description: Optional[str] = None
+    voice_description: Optional[str] = None
+
+
 
 class FollowupStepInput(BaseModel):
     session_id: str
@@ -53,7 +56,7 @@ class FollowupStepInput(BaseModel):
 class AnswerInput(BaseModel):
     session_id: str
     answer: Union[str, list[str], None] = None
-    voice_answer: Optional[str] = None
+
 
 # ----------------------- LLM Agents -----------------------
 # ----------------------- Helper Functions -----------------------
@@ -441,7 +444,15 @@ Examples:
 @app.post("/load-form")
 def load_form_from_description(request: DescriptionRequest):
     try:
-        description = request.description
+        # If voice_description is provided, transcribe it to text
+        if request.voice_description:
+            description = transcribe_base64_audio(request.voice_description)
+        elif request.description:
+            description = request.description
+        else:
+            return {"error": "No description provided."}
+
+        # Generate session ID using the description hash
         session_id = f"clarify_{hash(description)}"
         session_store[session_id] = {
             "original_input": description,
@@ -449,8 +460,10 @@ def load_form_from_description(request: DescriptionRequest):
             "current_phase": "clarification"
         }
 
+        # Process the description for follow-up step or disease classification
         result = ask_next_followup_step(description, {})
 
+        # Return next question or move to form-filling phase
         if "next_question" in result:
             session_store[session_id]["clarification_state"]["current_question"] = result["next_question"]["question"]
             return {
@@ -468,6 +481,7 @@ def load_form_from_description(request: DescriptionRequest):
     except Exception as e:
         logging.error("Error in /load-form", exc_info=True)
         return {"error": str(e)}
+
 
 @app.post("/next")
 def next_question(data: AnswerInput):
