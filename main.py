@@ -206,13 +206,11 @@ def validate_answer(answer, question):
     options = question.get("options")
 
     # Skip validation for signature or text questions
-    if qtype in ["signature", "text"]:
+    if qtype in ["signature"]:
         return True
 
     # Rule-based: date format check
     if qtype == "date":
-        if isinstance(answer, str) and answer.strip() == "":
-            return True  # allow empty
         try:
             datetime.strptime(answer, "%Y-%m-%d")
         except ValueError:
@@ -227,7 +225,7 @@ def validate_answer(answer, question):
                 raise ValueError(f"All selected answers must be among: {options}")
 
     # Skip LLM validation for checkbox or date fields (already rule-based)
-    if qtype in ["checkbox", "date"]:
+    if qtype in ["checkbox"]:
         return True
 
     # Only run LLM validation for unknown or custom types
