@@ -20,7 +20,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-     allow_origins=["http://localhost:5173"],  # frontend origin
+     allow_origins=["http://localhost:5173","http://localhost:5174"],  # frontend origin
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -260,11 +260,11 @@ def validate_answer(answer, question):
             return True
         elif result.upper().startswith("INVALID"):
             reason = result.partition(":")[2].strip()
-            raise ValueError(f"LLM Validation failed: {reason}")
+            raise ValueError(reason)
         else:
             raise ValueError(f"Unexpected validation output: {result}")
     except Exception as e:
-        raise ValueError(f"Answer validation failed: {e}")
+        raise ValueError(e)
 
 # ----------------------- API Endpoints -----------------------
 def clean_llm_json(text: str) -> str:
@@ -422,6 +422,7 @@ fever
 dermatology
 pain
 urinary
+endocrine
 general
 
 Return ONLY the category name. No punctuation. No extra words. Lowercase only.
