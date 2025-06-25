@@ -122,7 +122,7 @@ Your task is to extract:
   }},
   {{
     "question": "Do you agree to the following: 'I agree to the terms and conditions'?",
-    "type": "checkbox",
+    "type": "radio",
     "options": ["I agree" ,I don't agree"]
   }},
   ...
@@ -356,7 +356,7 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
             {{
               "next_question": {{
                 "question": "...",
-                "type": "checkbox",
+                "type": "radio",
                 "options": ["Yes", "No"]
               }}
             }}
@@ -393,10 +393,10 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
     # Fallback behavior: pick a new question not already asked
     asked = set(previous_answers.keys())
     common_followups = [
-        {"question": "Do you feel chest tightness during exertion?", "type": "checkbox", "options": ["Yes", "No"]},
-        {"question": "Do you experience heartburn after meals?", "type": "checkbox", "options": ["Yes", "No"]},
-        {"question": "Do you feel anxious or panicked during symptoms?", "type": "checkbox", "options": ["Yes", "No"]},
-        {"question": "Do you have difficulty breathing at rest?", "type": "checkbox", "options": ["Yes", "No"]},
+        {"question": "Do you feel chest tightness during exertion?", "type": "radio", "options": ["Yes", "No"]},
+        {"question": "Do you experience heartburn after meals?", "type": "radio", "options": ["Yes", "No"]},
+        {"question": "Do you feel anxious or panicked during symptoms?", "type": "radio", "options": ["Yes", "No"]},
+        {"question": "Do you have difficulty breathing at rest?", "type": "radio", "options": ["Yes", "No"]},
     ]
 
     for q in common_followups:
@@ -544,10 +544,19 @@ def load_form_from_description(request: DescriptionRequest):
         }
 
         # Process the description for follow-up step or disease classification
-        result = ask_next_followup_step(description, {})
+        result = None
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                result = ask_next_followup_step(description, {})
+                break
+            except Exception as e:
+                logging.warning(f"ask_next_followup_step failed (attempt {attempt+1}): {e}")
+        if result is None:
+            return {"error": "Unable to classify or continue"}
 
         # Return next question or move to form-filling phase
-        if "next_question" in result:
+        if "next_question" in result and isinstance(result["next_question"], dict):
             session_store[session_id]["clarification_state"]["current_question"] = result["next_question"]["question"]
             return {
                 "next_question": result["next_question"],
@@ -555,9 +564,15 @@ def load_form_from_description(request: DescriptionRequest):
                 "current_phase": "clarification"
             }
 
-        elif "disease" in result:
+        elif "disease" in result and isinstance(result["disease"], str):
             disease = result["disease"]
-            return start_form_filling_flow(session_id, description, disease)
+            for attempt in range(max_retries + 1):
+                try:
+                    return start_form_filling_flow(session_id, description, disease)
+                except Exception as e:
+                     logging.warning(f"start_form_filling_flow failed (attempt {attempt+1}): {e}")
+            return {"error": "Form loading failed after retries."}
+
 
         return {"error": "Unable to classify or continue"}
 
