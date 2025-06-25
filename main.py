@@ -34,12 +34,26 @@ logging.basicConfig(level=logging.INFO)
 llm = LLM(
     model="groq/gemma2-9b-it",
     temperature=0.7,
-    api_key="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"
+    api_key="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",
+    request_timeout=60  # timeout in seconds (default is 30s)
 )
 
 whisper_model = whisper.load_model("tiny")
 
+def validate_city_state_zip(address: str) -> dict:
+    pattern = r"(?P<city>[A-Za-z\s]+),?\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})"
+    match = re.search(pattern, address)
+    if match:
+        return {
+            "city": match.group("city").strip(),
+            "state": match.group("state").strip(),
+            "zip": match.group("zip").strip()
+        }
+    return {"error": "Could not extract city, state, and zip from input"}
+
 session_store = {}
+
+
 
 class DescriptionRequest(BaseModel):
     description: Optional[str] = None
@@ -205,6 +219,11 @@ def validate_answer(answer, question):
     qtype = question.get("type")
     options = question.get("options")
 
+    if "address" in question.get("question", "").lower():
+        result = validate_city_state_zip(answer)
+        if "error" in result:
+            raise ValueError("Invalid address. Please use format like 'City, ST ZIP' (e.g., Houston, TX 77005)")
+
     # Skip validation for signature or text questions
     if qtype in ["signature"]:
         return True
@@ -268,84 +287,104 @@ def validate_answer(answer, question):
 
 # ----------------------- API Endpoints -----------------------
 def clean_llm_json(text: str) -> str:
+    # Remove smart quotes, stray characters, and markdown
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
-    text = re.sub(r'[\x00-\x1F\x7F]', '', text)  # Remove control characters
-    text = re.sub(r",(\s*[}\]])", r"\1", text)  # Trailing commas
-    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)  # Remove markdown blocks
+    text = re.sub(r'[\x00-\x1F\x7F]', '', text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)
+
+    # Remove any leading non-JSON text before the first curly brace
+    json_start = text.find("{")
+    if json_start != -1:
+        text = text[json_start:]
+
     return text.strip()
 
 # Dummy session_store (use a database or Redis in production)
 session_store = {}
 
 def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
-    followup_agent = Agent(
-        role="Telemedicine Diagnostic Assistant",
-        goal="Identify exact single-word disease name or ask follow-up",
-        backstory="Acts as a step-by-step medical assistant in a telemedicine chatbot, returning exact disease names for routing to appropriate forms.",
-        verbose=False,
-        allow_delegation=False,
-        llm=llm
-    )
-
-    qa_str = "\n".join(f"- {q}: {a}" for q, a in previous_answers.items())
-
-    task = Task(
-    description=dedent(f"""
-    You are assisting in a telemedicine triage session.
-
-    Symptom: "{original_input}"
-
-    Patient has already answered:
-    {qa_str if qa_str else "None"}
-
-    ⚠️ Do not repeat previous questions.
-
-    🤖 Use the **answers to guide your logic**:
-    - If they say “No” to exertion-based symptoms, consider **non-cardiac** causes.
-    - If they say “Yes” to heartburn or meals, consider **digestive**.
-
-    👉 If more clarification is needed, return:
-    {{
-    "next_question": {{
-        "question": "...",
-        "type": "checkbox",
-        "options": ["Yes", "No"]
-    }}
-    }}
-
-    👉 If confident, return:
-    {{
-    "disease": "gastritis"
-    }}
-
-    ⚠️ Disease must be one lowercase word. No commentary.
-    """),
-    expected_output="Strict JSON with either 'next_question' or 'disease'",
-    agent=followup_agent
-    )
-
-    crew = Crew(agents=[followup_agent], tasks=[task], verbose=False)
-    result = crew.kickoff()
-    raw_output = crew.kickoff().raw.strip()
-    logging.error(f"[LLM RAW OUTPUT] {raw_output}")  # 👈 critical
-
     try:
+        followup_agent = Agent(
+            role="Telemedicine Diagnostic Assistant",
+            goal="Identify exact single-word disease name or ask follow-up",
+            backstory="Acts as a step-by-step medical assistant in a telemedicine chatbot, returning exact disease names for routing to appropriate forms.",
+            verbose=False,
+            allow_delegation=False,
+            llm=llm
+        )
+
+        qa_str = "\n".join(f"- {q}: {a}" for q, a in previous_answers.items())
+
+        task = Task(
+            description=dedent(f"""
+            You are assisting in a telemedicine triage session.
+
+            Symptom: "{original_input}"
+
+            Patient has already answered:
+            {qa_str if qa_str else "None"}
+
+            ⚠️ Do not repeat previous questions.
+
+            🤖 Use the **answers to guide your logic**:
+            - If they say “No” to exertion-based symptoms, consider **non-cardiac** causes.
+            - If they say “Yes” to heartburn or meals, consider **digestive**.
+
+            👉 If more clarification is needed, return:
+            {{
+              "next_question": {{
+                "question": "...",
+                "type": "radio",
+                "options": ["Yes", "No"]
+              }}
+            }}
+
+            👉 If confident, return:
+            {{
+              "disease": "gastritis"
+            }}
+
+            ⚠️ Disease must be one lowercase word. No commentary.
+            """),
+            expected_output="Strict JSON with either 'next_question' or 'disease'",
+            agent=followup_agent
+        )
+
+        crew = Crew(agents=[followup_agent], tasks=[task], verbose=False)
+        result = crew.kickoff()
+        raw_output = result.raw.strip()
+
+        logging.error(f"[LLM RAW OUTPUT] {raw_output}")  # Optional: helpful for debugging
+
         cleaned = clean_llm_json(raw_output)
-        logging.error(f"[CLEANED OUTPUT] {cleaned}")  # 👈 see if it's valid JSON now
+        logging.error(f"[CLEANED OUTPUT] {cleaned}")
+
         parsed = json.loads(cleaned)
         return parsed
+
     except Exception as e:
-        logging.exception("❌ JSON parsing failed in follow-up step")
-        raise ValueError("Failed to parse LLM output for follow-up step")
+        logging.exception("❌ Follow-up step failed due to LLM or parsing error")
+        return {
+            "error": "LLM failed to respond. Please try again shortly."
+        }
+
 
 def start_form_filling_flow(session_id, input_text, disease):
     # Step 1: Classify detailed disease to category using LLM
     category = classify_disease_to_category(disease)
 
-    # Step 2: Load the form PDF based on category
-    pdf_path = os.path.join("forms", f"{category}.pdf")
-    if not os.path.exists(pdf_path):
-        pdf_path = os.path.join("forms", "generic.pdf")
+     # Try loading PDF by disease name first
+    disease_pdf = os.path.join("forms", f"{disease}.pdf")
+    category_pdf = os.path.join("forms", f"{category}.pdf")
+    generic_pdf = os.path.join("forms", "generic.pdf")
+
+    if os.path.exists(disease_pdf):
+        pdf_path = disease_pdf
+    elif os.path.exists(category_pdf):
+        pdf_path = category_pdf
+    else:
+        pdf_path = generic_pdf
 
     print(f"🎯 Disease: {disease}")
     print(f"📂 Category: {category}")
@@ -360,7 +399,8 @@ def start_form_filling_flow(session_id, input_text, disease):
     # Step 4: Generate questions from form content
     questions = generate_questions_from_text(text)
     raw_output = clean_llm_json(questions.raw)
-    questions_list = json.loads(raw_output)
+    cleaned = clean_llm_json(raw_output)
+    questions_list = json.loads(cleaned)
 
     # Step 5: Try to prefill answers from user input
     prefilled = prefill_answers_from_questions(input_text, questions_list)
