@@ -150,7 +150,28 @@ def prefill_answers_from_questions(user_input: str, questions: list) -> dict:
         allow_delegation=False,
         llm=llm
     )
-    q_string = "\n".join(f"- {q['question']}" for q in questions)
+
+    # 🔄 Parse if passed as JSON string
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(clean_llm_json(questions))
+        except Exception as e:
+            print("Failed to parse questions:", e)
+            questions = []
+
+    # 🧼 Normalize questions
+    normalized_questions = []
+    for q in questions:
+        if isinstance(q, dict):
+            normalized_questions.append(q)
+        elif isinstance(q, str):
+            normalized_questions.append({"question": q})
+        else:
+            print("Invalid question format:", q)
+
+    # 📋 Convert to string for LLM
+    q_string = "\n".join(f"- {q['question']}" for q in normalized_questions)
+
     task = Task(
         description=dedent(f"""
 Based on this input:
@@ -170,20 +191,20 @@ Only include questions you can confidently answer.
         expected_output="JSON of question: answer pairs",
         agent=prefill_agent,
     )
+
     crew = Crew(agents=[prefill_agent], tasks=[task], verbose=True)
     result = crew.kickoff(inputs={"input": user_input})
-    
     prefilled = json.loads(result.raw)
 
-    # Fill today’s date for relevant date fields if missing
+    # 🗓 Add auto-fill logic for dates
     today = datetime.today().strftime("%Y-%m-%d")
-    for q in questions:
+    for q in normalized_questions:
         if q.get("type") == "date" and q["question"] not in prefilled:
-            q_text = q["question"].lower()
-            if any(keyword in q_text for keyword in ["visit", "today", "appointment", "current date", "date of visit"]):
+            if any(k in q["question"].lower() for k in ["visit", "today", "appointment", "current date"]):
                 prefilled[q["question"]] = today
 
     return prefilled
+
 
 def get_next_unanswered_index(answers: list):
     for idx, ans in enumerate(answers):
@@ -219,13 +240,14 @@ def validate_answer(answer, question):
     qtype = question.get("type")
     options = question.get("options")
 
-    if "address" in question.get("question", "").lower():
+    qtext = question.get("question", "").lower()
+    if "address" in qtext and "email" not in qtext:
         result = validate_city_state_zip(answer)
         if "error" in result:
             raise ValueError("Invalid address. Please use format like 'City, ST ZIP' (e.g., Houston, TX 77005)")
 
     # Skip validation for signature or text questions
-    if qtype in ["signature"]:
+    if qtype in ["signature","text","number"]:
         return True
 
     # Rule-based: date format check
@@ -287,18 +309,17 @@ def validate_answer(answer, question):
 
 # ----------------------- API Endpoints -----------------------
 def clean_llm_json(text: str) -> str:
-    # Remove smart quotes, stray characters, and markdown
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
-    text = re.sub(r'[\x00-\x1F\x7F]', '', text)
-    text = re.sub(r",(\s*[}\]])", r"\1", text)
-    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)
+    text = re.sub(r'[\x00-\x1F\x7F]', '', text)  # Remove control characters
+    text = re.sub(r",(\s*[}\]])", r"\1", text)  # Remove trailing commas
+    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE)  # Remove markdown blocks
 
-    # Remove any leading non-JSON text before the first curly brace
-    json_start = text.find("{")
-    if json_start != -1:
-        text = text[json_start:]
-
-    return text.strip()
+    # Detect where the actual JSON starts (either list or dict)
+    json_start = min(
+        [i for i in [text.find("{"), text.find("[")] if i != -1],
+        default=0
+    )
+    return text[json_start:].strip()
 
 # Dummy session_store (use a database or Redis in production)
 session_store = {}
@@ -335,7 +356,7 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
             {{
               "next_question": {{
                 "question": "...",
-                "type": "radio",
+                "type": "checkbox",
                 "options": ["Yes", "No"]
               }}
             }}
@@ -355,19 +376,43 @@ def ask_next_followup_step(original_input: str, previous_answers: dict) -> dict:
         result = crew.kickoff()
         raw_output = result.raw.strip()
 
-        logging.error(f"[LLM RAW OUTPUT] {raw_output}")  # Optional: helpful for debugging
-
         cleaned = clean_llm_json(raw_output)
-        logging.error(f"[CLEANED OUTPUT] {cleaned}")
-
         parsed = json.loads(cleaned)
-        return parsed
 
+        # Success path
+        if "disease" in parsed:
+            return {"disease": parsed["disease"]}
+        elif "next_question" in parsed:
+            return {"next_question": parsed["next_question"]}
+        else:
+            logging.warning("LLM output missing expected keys. Restarting from first question.")
+    
     except Exception as e:
-        logging.exception("❌ Follow-up step failed due to LLM or parsing error")
-        return {
-            "error": "LLM failed to respond. Please try again shortly."
-        }
+        logging.warning(f"LLM follow-up error: {str(e)}. Restarting clarification.")
+
+    # Fallback behavior: pick a new question not already asked
+    asked = set(previous_answers.keys())
+    common_followups = [
+        {"question": "Do you feel chest tightness during exertion?", "type": "checkbox", "options": ["Yes", "No"]},
+        {"question": "Do you experience heartburn after meals?", "type": "checkbox", "options": ["Yes", "No"]},
+        {"question": "Do you feel anxious or panicked during symptoms?", "type": "checkbox", "options": ["Yes", "No"]},
+        {"question": "Do you have difficulty breathing at rest?", "type": "checkbox", "options": ["Yes", "No"]},
+    ]
+
+    for q in common_followups:
+        if q["question"] not in asked:
+            return {"next_question": q}
+
+    # If all fallback questions are used, assume general condition
+    return {"disease": "general"}
+
+def safe_json_parse(text):
+    decoder = json.JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(text)
+        return obj
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}")
 
 
 def start_form_filling_flow(session_id, input_text, disease):
@@ -399,8 +444,7 @@ def start_form_filling_flow(session_id, input_text, disease):
     # Step 4: Generate questions from form content
     questions = generate_questions_from_text(text)
     raw_output = clean_llm_json(questions.raw)
-    cleaned = clean_llm_json(raw_output)
-    questions_list = json.loads(cleaned)
+    questions_list = json.loads(raw_output)
 
     # Step 5: Try to prefill answers from user input
     prefilled = prefill_answers_from_questions(input_text, questions_list)
